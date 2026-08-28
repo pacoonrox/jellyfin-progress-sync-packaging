@@ -30,12 +30,14 @@ jobs:
         with:
           repository: ${{ vars.JELLYFIN_SERVER_REPOSITORY }}
           path: jellyfin-server
+          fetch-depth: 0
 
       - name: Check out Jellyfin web fork
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.JELLYFIN_WEB_REPOSITORY }}
           path: jellyfin-web
+          fetch-depth: 0
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
