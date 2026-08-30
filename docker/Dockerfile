@@ -165,6 +165,8 @@ RUN apt-get update \
  && apt-get install --no-install-recommends --no-install-suggests --yes \
     ${FFMPEG_PACKAGE} \
     openssl \
+    python3 \
+    python3-requests \
     locales \
     libicu76 \
     libfontconfig1 \
@@ -250,6 +252,10 @@ RUN mkdir -p ${JELLYFIN_DATA_DIR} ${JELLYFIN_CACHE_DIR} \
 
 COPY --from=server /server /jellyfin
 COPY --from=web /web /jellyfin/jellyfin-web
+COPY security_agent.py /opt/jellyfin-security/security_agent.py
+COPY security-alerts.example.json /opt/jellyfin-security/security-alerts.example.json
+COPY docker/security-entrypoint.sh /security-entrypoint.sh
+RUN chmod 755 /security-entrypoint.sh
 ARG JELLYFIN_VERSION
 LABEL "org.opencontainers.image.source"="https://github.com/jellyfin/jellyfin-packaging"
 LABEL "org.opencontainers.image.title"="Jellyfin"
@@ -260,7 +266,7 @@ LABEL "org.opencontainers.image.url"="https://jellyfin.org"
 
 EXPOSE 8096
 VOLUME ${JELLYFIN_DATA_DIR} ${JELLYFIN_CACHE_DIR}
-ENTRYPOINT ["/jellyfin/jellyfin"]
+ENTRYPOINT ["/security-entrypoint.sh"]
 
 HEALTHCHECK --interval=30s --timeout=30s --start-period=10s --retries=3 \
      CMD curl --noproxy 'localhost' -Lk -fsS "${HEALTHCHECK_URL}" || exit 1

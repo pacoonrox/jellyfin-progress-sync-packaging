@@ -1,5 +1,7 @@
 # Ignore temporary build files
 build/
+__pycache__/
+*.py[cod]
 # Ignore the output artifact directory
 out/
 # Ignore the generated Debian changelog
