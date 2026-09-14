@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -23,7 +24,7 @@ IP_RE = re.compile(
     r"(?P<ip>(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4})"
 )
 DENIED_LOG_RE = re.compile(
-    r"Authentication request for (?P<username>.+?) has been denied \(IP: (?P<ip>[^)]+)\)\.",
+    r"Authentication request for (?P<username>.+?) has been denied \((?P<source>.*)\)\.",
     re.IGNORECASE,
 )
 LOG_TS_RE = re.compile(r"^\[(?P<time>\d{2}:\d{2}:\d{2})\]")
@@ -64,10 +65,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "webhook_url": "",
         "username": "Jellyfin Security",
         "avatar_url": "",
+        "mention": "@dakxp",
     },
     "thresholds": {
         "failures": 5,
         "window_seconds": 600,
+    },
+    "proxy": {
+        "trust_headers": False,
+        "trusted_proxies": [],
+        "header_names": [
+            "CF-Connecting-IP",
+            "CF-Connecting-IPv6",
+            "True-Client-IP",
+            "X-Forwarded-For",
+            "X-Real-IP",
+            "Forwarded",
+        ],
     },
     "ban": {
         "enabled": False,
@@ -164,6 +178,86 @@ def extract_ip(text: str) -> str:
     return ""
 
 
+def extract_forwarded_ips(text: str, header_names: list[str] | None = None) -> list[str]:
+    ips: list[str] = []
+    allowed_headers = {header.lower() for header in header_names or []}
+    patterns = [
+        ("CF-Connecting-IP", r"\bCF-Connecting-IP\s*[:=]\s*(?P<value>[^\s,;]+)"),
+        ("CF-Connecting-IPv6", r"\bCF-Connecting-IPv6\s*[:=]\s*(?P<value>[^\s,;]+)"),
+        ("True-Client-IP", r"\bTrue-Client-IP\s*[:=]\s*(?P<value>[^\s,;]+)"),
+        ("X-Forwarded-For", r"\bX-Forwarded-For\s*[:=]\s*(?P<value>[^\n\r;]+)"),
+        ("X-Real-IP", r"\bX-Real-IP\s*[:=]\s*(?P<value>[^\s,;]+)"),
+        ("Forwarded", r"\bForwarded\s*[:=]\s*(?P<value>[^\n\r]+)"),
+    ]
+    for header_name, pattern in patterns:
+        if allowed_headers and header_name.lower() not in allowed_headers:
+            continue
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            value = match.group("value")
+            for ip_match in IP_RE.finditer(value):
+                ip = ip_match.group("ip").strip("[]\"().,;")
+                if valid_ip(ip):
+                    ips.append(ip)
+    return list(dict.fromkeys(ips))
+
+
+def extract_request_host(text: str) -> str:
+    patterns = [
+        r"\bX-Forwarded-Host\s*[:=]\s*(?P<value>[^\s,;]+)",
+        r"\bX-Original-Host\s*[:=]\s*(?P<value>[^\s,;]+)",
+        r"\bHost\s*[:=]\s*(?P<value>[^\s,;]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group("value").strip("[]\"().,;")
+    return ""
+
+
+def extract_source_value(text: str, name: str) -> str:
+    pattern = rf"(?:^|;\s*){re.escape(name)}\s*:\s*(?P<value>.*?)(?=;\s*[\w-]+\s*:|$)"
+    match = re.search(pattern, text, re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group("value").strip("[]\"().,; ")
+
+
+def clean_discord_value(value: str | None, fallback: str = "unknown") -> str:
+    value = (value or "").strip()
+    if not value:
+        return fallback
+    return value[:1024]
+
+
+def bool_icon(value: bool) -> str:
+    return "Yes" if value else "No"
+
+
+def display_time(value: datetime) -> str:
+    eastern = value.astimezone(ZoneInfo("America/New_York"))
+    return eastern.strftime("%B %-d, %Y at %-I:%M:%S %p %Z")
+
+
+def client_ip_for_activity(cfg: dict[str, Any], activity: Activity) -> str:
+    direct_ip = activity.ip
+    proxy_cfg = cfg.get("proxy") or {}
+    if not proxy_cfg.get("trust_headers"):
+        return direct_ip
+
+    forwarded_ips = extract_forwarded_ips(
+        " ".join([activity.short_overview, activity.overview, activity.name]),
+        list(proxy_cfg.get("header_names") or []),
+    )
+    if not forwarded_ips:
+        return direct_ip
+
+    trusted_proxies = list(proxy_cfg.get("trusted_proxies") or [])
+    if direct_ip and trusted_proxies and not is_allowed(direct_ip, trusted_proxies):
+        return direct_ip
+
+    return forwarded_ips[0]
+
+
 def extract_failed_user(name: str) -> str:
     patterns = [
         r"failed login attempt (?:from|by|of user)\s+(?P<user>.+)$",
@@ -247,7 +341,8 @@ def log_activity(path: Path, line_number: int, line: str) -> Activity | None:
     match = DENIED_LOG_RE.search(line)
     if not match:
         return None
-    ip = match.group("ip").strip()
+    source = match.group("source").strip()
+    ip = extract_ip(source)
     username = match.group("username").strip()
     timestamp = parse_dt(None)
     ts_match = LOG_TS_RE.search(line)
@@ -301,38 +396,63 @@ def initialize_last_id(db_path: Path, lookback_minutes: int) -> int:
     return last_id
 
 
-def discord_embed(activity: Activity, title: str, color: int, extra: dict[str, str]) -> dict[str, Any]:
+def discord_embed(
+    activity: Activity,
+    title: str,
+    color: int,
+    extra: dict[str, str],
+    display_ip: str | None = None,
+) -> dict[str, Any]:
+    username = clean_discord_value(activity.username)
+    domain = clean_discord_value(extra.get("Domain"), "Unavailable from log fallback")
+    client_ip = clean_discord_value(display_ip or extra.get("Client IP") or activity.ip)
+    failures = clean_discord_value(extra.get("Failures In Window"), "0")
+    source = clean_discord_value(extra.get("Source"), activity.source or "unknown")
+    source_text = " ".join([activity.short_overview, activity.overview, activity.name])
+    device = clean_discord_value(extra.get("Device") or extract_source_value(source_text, "Device"), "unknown")
+    user_agent = clean_discord_value(extra.get("User-Agent") or extract_source_value(source_text, "User-Agent"), "unknown")
+
     fields = [
-        {"name": "Type", "value": activity.type or "unknown", "inline": True},
-        {"name": "Username", "value": activity.username or "unknown", "inline": True},
-        {"name": "IP", "value": activity.ip or "unknown", "inline": True},
-        {"name": "Activity ID", "value": str(activity.id), "inline": True},
-        {"name": "Time", "value": activity.date.isoformat().replace("+00:00", "Z"), "inline": True},
+        {"name": "Account", "value": username, "inline": True},
+        {"name": "Client IP", "value": client_ip, "inline": True},
+        {"name": "Domain", "value": domain, "inline": True},
+        {"name": "Failures", "value": failures, "inline": True},
+        {"name": "Time", "value": display_time(activity.date), "inline": True},
+        {"name": "Device", "value": device, "inline": True},
+        {"name": "User-Agent", "value": user_agent, "inline": False},
     ]
-    for key, value in extra.items():
-        fields.append({"name": key, "value": value or "unknown", "inline": True})
-    fields.extend(
-        [
-            {"name": "Name", "value": activity.name[:1024] or "unknown", "inline": False},
-            {"name": "Short Overview", "value": activity.short_overview[:1024] or "none", "inline": False},
-        ]
-    )
+
     return {
         "title": title,
+        "description": f"Failed Jellyfin login for `{username}`." if activity.type == "AuthenticationFailed" else activity.name[:2048],
         "color": color,
         "timestamp": activity.date.isoformat().replace("+00:00", "Z"),
         "fields": fields,
+        "footer": {
+            "text": f"{source} | Activity {activity.id}"
+        },
     }
 
 
-def send_discord(cfg: dict[str, Any], activity: Activity, title: str, color: int, extra: dict[str, str]) -> None:
+def send_discord(
+    cfg: dict[str, Any],
+    activity: Activity,
+    title: str,
+    color: int,
+    extra: dict[str, str],
+    display_ip: str | None = None,
+) -> None:
     webhook_url = str(cfg["discord"].get("webhook_url") or "")
     if not webhook_url:
         return
     payload: dict[str, Any] = {
         "username": cfg["discord"].get("username") or "Jellyfin Security",
-        "embeds": [discord_embed(activity, title, color, extra)],
+        "embeds": [discord_embed(activity, title, color, extra, display_ip)],
     }
+    mention = str(cfg["discord"].get("mention") or "").strip()
+    if mention:
+        payload["content"] = mention
+        payload["allowed_mentions"] = {"parse": ["users", "roles"]}
     avatar_url = cfg["discord"].get("avatar_url")
     if avatar_url:
         payload["avatar_url"] = avatar_url
@@ -398,30 +518,46 @@ class SecurityAgent:
             save_state(state_path, state)
 
         alert_types = set(cfg.get("alert_types") or [])
-        use_logs_for_auth_failures = bool(cfg.get("log_paths"))
+        processed_db_auth_failures = 0
         for activity in activity_rows(db_path, int(state.get("last_id") or 0)):
             state["last_id"] = max(int(state.get("last_id") or 0), activity.id)
             if activity.type not in alert_types:
                 continue
-            if use_logs_for_auth_failures and activity.type == "AuthenticationFailed":
-                continue
+            if activity.type == "AuthenticationFailed":
+                processed_db_auth_failures += 1
             self.handle_activity(cfg, state, activity)
         for activity in log_rows(list(cfg.get("log_paths") or []), state):
             if activity.type not in alert_types:
+                continue
+            if activity.type == "AuthenticationFailed" and processed_db_auth_failures:
                 continue
             self.handle_activity(cfg, state, activity)
         save_state(state_path, state)
 
     def handle_activity(self, cfg: dict[str, Any], state: dict[str, Any], activity: Activity) -> None:
         if activity.type == "AuthenticationFailed":
-            ip = activity.ip
+            ip = client_ip_for_activity(cfg, activity)
             count = self.record_failure(cfg, ip)
+            extra = {"Failures In Window": str(count), "Source": activity.source}
+            request_host = extract_request_host(" ".join([activity.short_overview, activity.overview, activity.name]))
+            if request_host:
+                extra["Domain"] = request_host
+            device = extract_source_value(" ".join([activity.short_overview, activity.overview, activity.name]), "Device")
+            if device:
+                extra["Device"] = device
+            user_agent = extract_source_value(" ".join([activity.short_overview, activity.overview, activity.name]), "User-Agent")
+            if user_agent:
+                extra["User-Agent"] = user_agent
+            if ip and ip != activity.ip:
+                extra["Client IP"] = ip
+                extra["Proxy IP"] = activity.ip
             send_discord(
                 cfg,
                 activity,
                 "Jellyfin Failed Login",
                 0xD83A34,
-                {"Failures In Window": str(count), "Source": activity.source},
+                extra,
+                display_ip=ip,
             )
             if self.should_ban(cfg, state, ip, count):
                 self.ban(cfg, state, activity, ip, f"{count} failed Jellyfin logins")
