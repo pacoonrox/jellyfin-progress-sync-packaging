@@ -9,7 +9,9 @@
   "startup_lookback_minutes": 5,
   "alert_types": [
     "AuthenticationFailed",
-    "UserLockedOut"
+    "UserLockedOut",
+    "TwoFactorAuthenticationFailed",
+    "QuickConnectPortalEntered"
   ],
   "discord": {
     "webhook_url": "",

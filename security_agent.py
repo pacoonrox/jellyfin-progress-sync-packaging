@@ -60,7 +60,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "state_path": "/config/security-agent-state.json",
     "poll_interval_seconds": 15,
     "startup_lookback_minutes": 5,
-    "alert_types": ["AuthenticationFailed", "UserLockedOut"],
+    "alert_types": [
+        "AuthenticationFailed",
+        "UserLockedOut",
+        "TwoFactorAuthenticationFailed",
+        "QuickConnectPortalEntered",
+    ],
     "discord": {
         "webhook_url": "",
         "username": "Jellyfin Security",
@@ -110,9 +115,12 @@ class Activity:
     item_id: str
     severity: int | None
     source: str = "activity-log"
+    account_name: str = ""
 
     @property
     def username(self) -> str:
+        if self.account_name:
+            return self.account_name
         if self.type == "UserLockedOut":
             return extract_locked_user(self.name)
         return extract_failed_user(self.name)
@@ -129,7 +137,11 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    cfg = deep_merge(DEFAULT_CONFIG, load_json(path))
+    override = load_json(path)
+    cfg = deep_merge(DEFAULT_CONFIG, override)
+    if set(override.get("alert_types") or []) == {"AuthenticationFailed", "UserLockedOut"}:
+        # Upgrade installations still using the previous default alert set.
+        cfg["alert_types"] = list(DEFAULT_CONFIG["alert_types"])
     env_webhook = os.getenv("SECURITY_DISCORD_WEBHOOK_URL")
     if env_webhook:
         cfg["discord"]["webhook_url"] = env_webhook
@@ -326,6 +338,55 @@ def activity_rows(db_path: Path, after_id: int) -> list[Activity]:
     ]
 
 
+def security_audit_rows(db_path: Path, after_id: int) -> list[Activity]:
+    if not db_path.exists():
+        raise FileNotFoundError(f"database not found: {db_path}")
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=15) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT s.Id, s.TimestampUtc, s.Event, s.Source, s.Result, s.Detail,
+                       COALESCE(target.Username, actor.Username, 'Unknown') AS AccountName
+                FROM SecurityAuditRecords AS s
+                LEFT JOIN Users AS target ON target.Id = s.TargetUserId
+                LEFT JOIN Users AS actor ON actor.Id = s.ActingUserId
+                WHERE s.Id > ?
+                  AND s.Event IN ('TwoFactorAuthenticationFailed', 'QuickConnectPortalEntered')
+                ORDER BY s.Id ASC
+                """,
+                (after_id,),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return []
+            raise
+
+    activities: list[Activity] = []
+    for row in rows:
+        event_type = str(row["Event"] or "")
+        account_name = str(row["AccountName"] or "Unknown")
+        name = (
+            f"Wrong two-factor code entered for {account_name}"
+            if event_type == "TwoFactorAuthenticationFailed"
+            else f"{account_name} entered the Quick Connect portal"
+        )
+        activities.append(Activity(
+            id=int(row["Id"]),
+            date=parse_dt(str(row["TimestampUtc"] or "")),
+            type=event_type,
+            name=name,
+            short_overview=str(row["Detail"] or ""),
+            overview=f"Result: {row['Result']}; Source: {row['Source']}; {row['Detail'] or ''}",
+            user_id="",
+            item_id="",
+            severity=4 if event_type == "TwoFactorAuthenticationFailed" else 2,
+            source="security-audit",
+            account_name=account_name,
+        ))
+    return activities
+
+
 def iter_log_files(paths: list[str]) -> list[Path]:
     files: list[Path] = []
     for raw in paths:
@@ -390,6 +451,16 @@ def initialize_last_id(db_path: Path, lookback_minutes: int) -> int:
     cutoff = datetime.now(timezone.utc).timestamp() - (lookback_minutes * 60)
     last_id = 0
     for activity in activity_rows(db_path, 0):
+        if activity.date.timestamp() >= cutoff:
+            break
+        last_id = activity.id
+    return last_id
+
+
+def initialize_security_audit_last_id(db_path: Path, lookback_minutes: int) -> int:
+    cutoff = datetime.now(timezone.utc).timestamp() - (lookback_minutes * 60)
+    last_id = 0
+    for activity in security_audit_rows(db_path, 0):
         if activity.date.timestamp() >= cutoff:
             break
         last_id = activity.id
@@ -516,6 +587,12 @@ class SecurityAgent:
         if not state.get("last_id"):
             state["last_id"] = initialize_last_id(db_path, int(cfg.get("startup_lookback_minutes", 5)))
             save_state(state_path, state)
+        if not state.get("last_security_audit_id"):
+            state["last_security_audit_id"] = initialize_security_audit_last_id(
+                db_path,
+                int(cfg.get("startup_lookback_minutes", 5)),
+            )
+            save_state(state_path, state)
 
         alert_types = set(cfg.get("alert_types") or [])
         processed_db_auth_failures = 0
@@ -525,6 +602,14 @@ class SecurityAgent:
                 continue
             if activity.type == "AuthenticationFailed":
                 processed_db_auth_failures += 1
+            self.handle_activity(cfg, state, activity)
+        for activity in security_audit_rows(db_path, int(state.get("last_security_audit_id") or 0)):
+            state["last_security_audit_id"] = max(
+                int(state.get("last_security_audit_id") or 0),
+                activity.id,
+            )
+            if activity.type not in alert_types:
+                continue
             self.handle_activity(cfg, state, activity)
         for activity in log_rows(list(cfg.get("log_paths") or []), state):
             if activity.type not in alert_types:
@@ -565,6 +650,27 @@ class SecurityAgent:
 
         if activity.type == "UserLockedOut":
             send_discord(cfg, activity, "Jellyfin User Locked Out", 0xA855F7, {})
+            return
+
+        if activity.type == "TwoFactorAuthenticationFailed":
+            ip = client_ip_for_activity(cfg, activity)
+            count = self.record_failure(cfg, ip)
+            extra = {"Failures In Window": str(count), "Source": activity.source}
+            request_host = extract_request_host(" ".join([activity.short_overview, activity.overview]))
+            if request_host:
+                extra["Domain"] = request_host
+            send_discord(cfg, activity, "Jellyfin Wrong 2FA Code", 0xF97316, extra, display_ip=ip)
+            if self.should_ban(cfg, state, ip, count):
+                self.ban(cfg, state, activity, ip, f"{count} failed Jellyfin 2FA attempts")
+            return
+
+        if activity.type == "QuickConnectPortalEntered":
+            ip = client_ip_for_activity(cfg, activity)
+            extra = {"Source": activity.source}
+            request_host = extract_request_host(" ".join([activity.short_overview, activity.overview]))
+            if request_host:
+                extra["Domain"] = request_host
+            send_discord(cfg, activity, "Jellyfin Quick Connect Portal Entered", 0x2563EB, extra, display_ip=ip)
 
     def record_failure(self, cfg: dict[str, Any], ip: str) -> int:
         if not ip:
