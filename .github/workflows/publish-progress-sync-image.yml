@@ -71,6 +71,9 @@ jobs:
 
       - name: Tag and push image
         run: |
-          IMAGE="ghcr.io/${{ github.repository_owner }}/jellyfin-progress-sync:latest"
-          docker tag "jellyfin/jellyfin:${IMAGE_VERSION}-amd64" "$IMAGE"
-          docker push "$IMAGE"
+          BASE="ghcr.io/${{ github.repository_owner }}/jellyfin-server-progress-sync"
+          SHA_TAG="sha-${GITHUB_SHA::7}"
+          docker tag "jellyfin/jellyfin:${IMAGE_VERSION}-amd64" "$BASE:latest"
+          docker tag "jellyfin/jellyfin:${IMAGE_VERSION}-amd64" "$BASE:$SHA_TAG"
+          docker push "$BASE:latest"
+          docker push "$BASE:$SHA_TAG"
